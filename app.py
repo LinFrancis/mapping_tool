@@ -207,7 +207,7 @@ map_tab, register_tab, intranet_tab = st.tabs(["🗺️ Mapa", "📝 Registrarse
 
 
 # --------------
-# TAB: MAPA — versión final estable con Streamlit nativo
+# TAB: MAPA — completo (Puntos, Burbujas, Choropleth) con fondo por TileLayer (SIN TOKEN)
 # --------------
 with map_tab:
     st.subheader("Mapa de espacios registrados")
@@ -218,52 +218,297 @@ with map_tab:
         st.rerun()
 
     df = read_df()
-
     if df.empty:
         st.warning("Aún no hay registros en la base de datos.")
         st.stop()
 
-    # Convertir a numérico y limpiar
+    # Conversión segura
     df["latitude"] = pd.to_numeric(df["latitude"], errors="coerce")
     df["longitude"] = pd.to_numeric(df["longitude"], errors="coerce")
-    valid_points = df.dropna(subset=["latitude", "longitude"]).copy()
+    points_all = df.dropna(subset=["latitude", "longitude"]).copy()
 
-    if valid_points.empty:
+    if points_all.empty:
         st.warning("No hay coordenadas válidas para mostrar en el mapa.")
-        st.info("Usa la pestaña 📝 Registrarse para agregar una dirección completa.")
-        st.map(pd.DataFrame({"lat": [-33.45], "lon": [-70.66]}))  # centro Chile
         st.stop()
 
-    st.success(f"Se encontraron {len(valid_points)} registros con coordenadas válidas.")
+    st.info("💡 Puedes pasar el mouse o hacer clic sobre puntos o polígonos para ver detalles.")
 
-    # Vista previa
-    with st.expander("Ver coordenadas cargadas"):
-        st.dataframe(valid_points[["space_name", "latitude", "longitude"]], use_container_width=True)
+    # -------- Panel de control
+    st.markdown("### ⚙️ Opciones de visualización")
+    colA, colB, colC = st.columns([1.2, 1, 1])
 
-    # Convertir a formato correcto
-    map_df = valid_points.rename(columns={"latitude": "lat", "longitude": "lon"})[["lat", "lon"]]
-
-    # Mostrar mapa nativo de Streamlit (sin pydeck ni tokens)
-    st.caption("🗺️ Mapa interactivo (base libre de Streamlit)")
-    st.map(map_df, zoom=8, size=50)
-
-    # Tabla completa
-    with st.expander("Ver tabla completa de registros"):
-        st.dataframe(
-            valid_points[
-                [
-                    "space_name",
-                    "rep_name",
-                    "email",
-                    "year_established",
-                    "full_address",
-                    "latitude",
-                    "longitude",
-                    "geocode_status",
-                ]
-            ].sort_values("space_name"),
-            use_container_width=True,
+    with colA:
+        view_mode = st.selectbox(
+            "Modo de visualización",
+            ["Puntos", "Burbujas por comuna", "Burbujas por región"],
+            index=0,
         )
+        regiones_disp = ["Todas"] + sorted(points_all["region"].dropna().unique().tolist())
+        region_filter = st.selectbox("Filtrar por región (aplica a Puntos/Burbujas)", regiones_disp, index=0)
+
+    with colB:
+        point_size = st.slider("🎯 Tamaño puntos/burbujas (px)", 6, 600, 220)
+        layer_opacity = st.slider("🧿 Opacidad capa (%)", 10, 100, 85) / 100.0
+        
+
+    with colC:
+        # basemap_choice = st.selectbox(
+        #     "🗺️ Mapa base (sin token)",
+        #     ["Carto Light", "Carto Dark", "Carto Voyager", "OSM Estándar"],
+        #     index=0,
+        # )
+        basemap_choice = "Carto Light"
+        zoom_manual = st.slider("🔍 Nivel de zoom", 4, 15, 7)
+        point_color = st.color_picker("🎨 Color puntos/burbujas", "#0064FA")
+
+    # -------- Utils
+    import os, json, unicodedata
+    import pydeck as pdk
+
+    def rgba_from_hex(hex_color: str, alpha_255: int = 200):
+        h = hex_color.lstrip("#")
+        return [int(h[i:i+2], 16) for i in (0, 2, 4)] + [alpha_255]
+
+    def normalize_txt(s):
+        if not isinstance(s, str):
+            return ""
+        s = unicodedata.normalize("NFD", s)
+        s = "".join(ch for ch in s if unicodedata.category(ch) != "Mn")
+        s = s.replace("’", "'").replace("´", "'").replace("`", "'")
+        return s.lower().strip()
+
+    def auto_view(lat_series, lon_series):
+        lat_mean = float(lat_series.mean())
+        lon_mean = float(lon_series.mean())
+        lat_range = float(lat_series.max() - lat_series.min())
+        lon_range = float(lon_series.max() - lon_series.min())
+        if lat_range < 0.1 and lon_range < 0.1:
+            z = 12
+        elif lat_range < 0.5 and lon_range < 0.5:
+            z = 10
+        elif lat_range < 2 and lon_range < 2:
+            z = 8
+        else:
+            z = 6
+        return lat_mean, lon_mean, z
+
+    # -------- Basemap por TileLayer (sin token)
+    # -------- Basemap por TileLayer (sin token) — con ID único para forzar cambio
+    TILESETS = {
+        "Carto Light": [
+            "https://a.basemaps.cartocdn.com/light_all/{z}/{x}/{y}{r}.png",
+            "https://b.basemaps.cartocdn.com/light_all/{z}/{x}/{y}{r}.png",
+            "https://c.basemaps.cartocdn.com/light_all/{z}/{x}/{y}{r}.png",
+        ],
+        "Carto Dark": [
+            "https://a.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png",
+            "https://b.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png",
+            "https://c.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png",
+        ],
+        "Carto Voyager": [
+            "https://a.basemaps.cartocdn.com/rastertiles/voyager/{z}/{x}/{y}{r}.png",
+            "https://b.basemaps.cartocdn.com/rastertiles/voyager/{z}/{x}/{y}{r}.png",
+            "https://c.basemaps.cartocdn.com/rastertiles/voyager/{z}/{x}/{y}{r}.png",
+        ],
+        "OSM Estándar": [
+            "https://tile.openstreetmap.org/{z}/{x}/{y}.png"
+        ],
+    }
+
+    tile_urls = TILESETS[basemap_choice]
+
+    # Opción para bustear caché de tiles si el navegador insiste en no refrescar
+    # force_reload = st.checkbox("♻️ Forzar recarga del mapa base", value=False, help="Actívalo si cambiaste el estilo y no ves diferencias")
+
+    force_reload = False
+
+    # 🟡 CLAVE: ID único por estilo (y timestamp si 'force_reload' está activo)
+    tile_layer = pdk.Layer(
+        "TileLayer",
+        id=f"basemap-{basemap_choice}-{int(time.time()*1000) if force_reload else basemap_choice}",
+        data=tile_urls if isinstance(tile_urls, list) else [tile_urls],
+        minZoom=0,
+        maxZoom=19,
+        tileSize=256,
+        opacity=1.0,
+        pickable=False,
+    )
+
+    # -------- Datos según filtro (para puntos/burbujas)
+    points = points_all.copy()
+    if view_mode != "Choropleth por región" and region_filter != "Todas":
+        points = points[points["region"] == region_filter]
+
+    # -------- Vista inicial (usa TODOS los puntos para encuadre general)
+    lat_c, lon_c, zoom_auto = auto_view(points_all["latitude"], points_all["longitude"])
+    zoom_level = zoom_manual if zoom_manual else zoom_auto
+
+    # -------- Capas
+    layers = [tile_layer]
+    tooltip = None
+    rgba = rgba_from_hex(point_color, alpha_255=int(layer_opacity * 255))
+
+    if view_mode == "Puntos":
+        point_layer = pdk.Layer(
+            "ScatterplotLayer",
+            data=points,
+            get_position="[longitude, latitude]",
+            get_fill_color=rgba,
+            get_radius=point_size,
+            radius_scale=1,
+            radius_min_pixels=1,
+            pickable=True,
+        )
+        layers.append(point_layer)
+        tooltip = {
+            "html": (
+                "<b>{space_name}</b><br/>"
+                "👤 {rep_name}<br/>"
+                "📧 {email}<br/>"
+                "📍 {full_address}<br/>"
+                "📅 Creado en {year_established}"
+            ),
+            "style": {"color": "black", "backgroundColor": "white", "padding": "6px"},
+        }
+
+    elif view_mode in ("Burbujas por comuna", "Burbujas por región"):
+        group_col = "comuna" if view_mode == "Burbujas por comuna" else "region"
+        agg = (
+            points.groupby(group_col)
+            .agg(latitude=("latitude", "mean"), longitude=("longitude", "mean"), n=("space_name", "count"))
+            .reset_index()
+        )
+        if agg.empty:
+            st.warning("No hay datos para agrupar con el filtro seleccionado.")
+        else:
+            max_n = max(int(agg["n"].max()), 1)
+            agg["radius"] = (agg["n"] / max_n) * point_size * 160
+
+            bubble_layer = pdk.Layer(
+                "ScatterplotLayer",
+                data=agg,
+                get_position="[longitude, latitude]",
+                get_fill_color=rgba,
+                get_radius="radius",
+                radius_scale=1,
+                radius_min_pixels=1,
+                pickable=True,
+            )
+            layers.append(bubble_layer)
+            tooltip = {
+                "html": f"<b>{group_col.capitalize()}</b>: {{{group_col}}}<br/>🌿 Espacios registrados: {{n}}",
+                "style": {"color": "black", "backgroundColor": "white", "padding": "6px"},
+            }
+
+    elif view_mode == "Choropleth por región":
+        # Cargar GeoJSON local de regiones
+        gj_path = os.path.join("data", "regiones_chile.geojson")
+        if not os.path.exists(gj_path):
+            st.error("No se encontró `data/regiones_chile.geojson`. Coloca el archivo para activar el choropleth.")
+        else:
+            with open(gj_path, "r", encoding="utf-8") as f:
+                regiones_gj = json.load(f)
+
+            # Conteo nacional por región (usa todos los puntos)
+            rc = points_all.groupby("region").size().reset_index(name="n_espacios")
+            rc["region_norm"] = rc["region"].apply(normalize_txt)
+
+            # Escala sencilla (azules)
+            def lerp(a, b, t):
+                return int(a + (b - a) * t)
+
+            min_col = (198, 219, 239)  # claro
+            max_col = (8, 48, 107)     # oscuro
+            max_val = max(1, int(rc["n_espacios"].max()))
+            alpha = int(layer_opacity * 255)
+
+            for feat in regiones_gj.get("features", []):
+                rname = normalize_txt(feat["properties"].get("region"))
+                row = rc[rc["region_norm"] == rname]
+                n = int(row["n_espacios"].values[0]) if not row.empty else 0
+                t = n / max_val
+                r = lerp(min_col[0], max_col[0], t)
+                g = lerp(min_col[1], max_col[1], t)
+                b = lerp(min_col[2], max_col[2], t)
+                feat["properties"]["n_espacios"] = n
+                feat["properties"]["_color"] = [r, g, b, alpha]
+
+            choropleth = pdk.Layer(
+                "GeoJsonLayer",
+                data=regiones_gj,
+                stroked=True,
+                filled=True,
+                extruded=False,
+                pickable=True,
+                get_fill_color="properties._color",
+                get_line_color=[255, 255, 255],
+                line_width_min_pixels=1,
+                opacity=1.0,  # alpha dentro del color
+            )
+            layers.append(choropleth)
+            tooltip = {
+                "html": "<b>{region}</b><br/>🌿 Espacios registrados: {n_espacios}",
+                "style": {"color": "black", "backgroundColor": "white", "padding": "6px"},
+            }
+
+    # -------- Render (sin mapbox; solo nuestras capas)
+    deck = pdk.Deck(
+        map_style=None,  # importante: SIN fondo de mapbox
+        initial_view_state=pdk.ViewState(
+            latitude=lat_c,
+            longitude=lon_c,
+            zoom=zoom_level,
+            pitch=0,
+        ),
+        layers=layers,
+        tooltip=tooltip if len(layers) > 1 else None,  # evita tooltip si solo hay tiles
+    )
+
+    st.pydeck_chart(deck, use_container_width=True)
+
+    # -------- Tablas de apoyo
+    with st.expander("📋 Ver tabla de registros mostrados"):
+        base_cols = ["region", "comuna", "space_name", "rep_name", "email", "year_established", "full_address"]
+        show_df = (points if view_mode != "Choropleth por región" else points_all).copy()
+        existing = [c for c in base_cols if c in show_df.columns]
+        if existing:
+            sort_cols = [c for c in ["region", "comuna", "space_name"] if c in existing]
+            st.dataframe(show_df[existing].sort_values(sort_cols if sort_cols else existing), use_container_width=True)
+
+    if view_mode == "Choropleth por región":
+        with st.expander("📊 Resumen por región"):
+            rc2 = points_all.groupby("region").size().reset_index(name="n_espacios").sort_values("n_espacios", ascending=False)
+            st.dataframe(rc2, use_container_width=True)
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 # ------------------
 # TAB: REGISTRARSE
