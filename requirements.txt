@@ -1,0 +1,6 @@
+streamlit>=1.36
+pandas>=2.2
+pydeck>=0.9
+geopy>=2.4
+gspread>=6.0
+google-auth>=2.34
